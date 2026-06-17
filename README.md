@@ -4,6 +4,8 @@ Sistema de **distribuição e monitoramento de atendimentos em tempo real**. Rot
 solicitação para o time correto, respeita o limite de atendimentos simultâneos por atendente,
 enfileira o excedente e puxa a fila (FIFO) assim que uma vaga abre — tudo sem polling.
 
+<img width="1336" height="1357" alt="2026-06-17 10 59 14 localhost d6e8fbe8035d" src="https://github.com/user-attachments/assets/6491bb8b-4c42-4e47-a68c-c5cb41e371c3" />
+
 ---
 
 ## Como rodar
