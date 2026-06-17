@@ -1,0 +1,11 @@
+.env
+
+# dependencies
+node_modules/
+
+# build outputs
+dist/
+frontend/dist/
+
+# Go binaries
+backend/api

@@ -1,0 +1,15 @@
+# Force LF for all text files — prevents CRLF inside Alpine/Linux containers on Windows clones
+* text=auto eol=lf
+
+# Explicitly binary — no newline conversion
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.otf binary
+*.pdf binary
