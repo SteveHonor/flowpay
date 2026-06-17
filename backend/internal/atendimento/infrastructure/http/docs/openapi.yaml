@@ -1,0 +1,537 @@
+openapi: "3.0.3"
+info:
+  title: FlowPay — Central de Atendimentos
+  version: "1.0.0"
+  description: |
+    API de distribuição e monitoramento de atendimentos em tempo real.
+
+    Roteia cada solicitação para o time correto (Cartões / Empréstimos / Outros),
+    distribui entre atendentes respeitando o limite de **3 simultâneos** por agente
+    e enfileira o excedente (FIFO), puxando da fila automaticamente ao abrir vaga.
+
+    ## Roteamento Assunto → Time
+
+    | Assunto | Time |
+    |---------|------|
+    | `problema_cartao` | Cartões |
+    | `contratacao_emprestimo` | Empréstimos |
+    | qualquer outro valor | Outros Assuntos |
+
+    ## Tempo real
+
+    O endpoint `/api/eventos` é um stream **Server-Sent Events** (`text/event-stream`).
+    Cada evento é emitido como `data: <JSON>\n\n`. Conecte via `EventSource` no browser:
+
+    ```js
+    const es = new EventSource('http://localhost:8080/api/eventos');
+    es.onmessage = e => console.log(JSON.parse(e.data));
+    ```
+
+    Ou via curl:
+    ```bash
+    curl -N http://localhost:8080/api/eventos
+    ```
+
+servers:
+  - url: http://localhost:8080
+    description: Desenvolvimento local / Docker Compose
+
+tags:
+  - name: Solicitações
+    description: Criação e finalização de solicitações de atendimento
+  - name: Atendentes
+    description: Gerenciamento dinâmico de atendentes (adicionar, pausar, retomar, remover)
+  - name: Dashboard
+    description: Snapshot do estado atual, stream SSE e histórico de eventos
+  - name: Sistema
+    description: Health check
+
+paths:
+  /api/solicitacoes:
+    post:
+      tags: [Solicitações]
+      summary: Criar solicitação
+      description: |
+        Cria uma solicitação e roteia automaticamente ao time responsável pelo assunto.
+
+        - Se houver atendente disponível (não pausado, com vaga), a solicitação é
+          atribuída imediatamente ao de **menor carga** (balanceamento por mínimo de ativos).
+        - Caso o time esteja lotado, a solicitação entra na **fila FIFO** do time.
+
+        Emite os eventos `solicitacao_recebida` + `solicitacao_atribuida` **ou**
+        `solicitacao_recebida` + `solicitacao_enfileirada` no stream SSE.
+      operationId: criarSolicitacao
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CriarSolicitacaoReq'
+            examples:
+              cartao:
+                summary: Problema com cartão → Time Cartões
+                value: { assunto: "problema_cartao" }
+              emprestimo:
+                summary: Contratação de empréstimo → Time Empréstimos
+                value: { assunto: "contratacao_emprestimo" }
+              outros:
+                summary: Outro assunto → Time Outros Assuntos
+                value: { assunto: "atualização_cadastral" }
+      responses:
+        '201':
+          description: Solicitação criada com sucesso
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+              example:
+                id: "sol_a1b2c3d4e5f6a7b8"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/solicitacoes/{id}/finalizar:
+    post:
+      tags: [Solicitações]
+      summary: Finalizar atendimento
+      description: |
+        Encerra o atendimento de uma solicitação em andamento.
+
+        Libera a vaga do atendente responsável. Se houver solicitações aguardando
+        na fila do time, a **próxima (FIFO)** é automaticamente atribuída ao atendente
+        que acabou de ficar livre.
+
+        Emite `atendimento_finalizado` (com `duracao_atendimento_seg`) e, se houver
+        pull da fila, `solicitacao_atribuida` (com `tempo_na_fila_seg`).
+      operationId: finalizarAtendimento
+      parameters:
+        - $ref: '#/components/parameters/SolicitacaoID'
+      responses:
+        '204':
+          description: Atendimento finalizado com sucesso
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/atendentes:
+    post:
+      tags: [Atendentes]
+      summary: Adicionar atendente
+      description: |
+        Adiciona um novo atendente ao time em tempo de execução.
+
+        O atendente passa a participar do balanceamento imediatamente.
+        Se houver solicitações na fila do time, ele puxa até atingir
+        a capacidade máxima (3 atendimentos simultâneos).
+
+        Emite `solicitacao_atribuida` para cada solicitação puxada da fila.
+      operationId: adicionarAtendente
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdicionarAtendenteReq'
+            example:
+              nome: "Ana"
+              time: "CARTOES"
+      responses:
+        '201':
+          description: Atendente adicionado com sucesso
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IDResp'
+              example:
+                id: "ate_a1b2c3d4"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '422':
+          description: Time não encontrado
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErroResp'
+              example:
+                erro: "time não encontrado"
+
+  /api/atendentes/{id}/pausar:
+    post:
+      tags: [Atendentes]
+      summary: Pausar atendente
+      description: |
+        Suspende o atendente para novas atribuições.
+
+        **Invariante**: só é permitido quando o atendente não tem atendimentos
+        ativos. Caso contrário, retorna `409 Conflict` — finalize os atendimentos
+        antes de pausar.
+
+        Uma vez pausado, o atendente não recebe novas solicitações. As solicitações
+        passam para outro atendente disponível ou vão para a fila.
+
+        Emite `atendente_pausado`.
+      operationId: pausarAtendente
+      parameters:
+        - $ref: '#/components/parameters/AtendenteID'
+      responses:
+        '204':
+          description: Atendente pausado com sucesso
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/atendentes/{id}/retomar:
+    post:
+      tags: [Atendentes]
+      summary: Retomar atendente
+      description: |
+        Reativa um atendente pausado.
+
+        Imediatamente puxa solicitações da fila do time até atingir
+        a capacidade máxima (3 atendimentos simultâneos).
+
+        Emite `atendente_retomado` + `solicitacao_atribuida` para cada
+        solicitação puxada da fila.
+      operationId: retomarAtendente
+      parameters:
+        - $ref: '#/components/parameters/AtendenteID'
+      responses:
+        '204':
+          description: Atendente retomado com sucesso
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/atendentes/{id}:
+    delete:
+      tags: [Atendentes]
+      summary: Remover atendente
+      description: |
+        Remove o atendente do time permanentemente.
+
+        **Invariante**: só é permitido quando o atendente não tem atendimentos
+        ativos. Caso contrário, retorna `409 Conflict`.
+
+        Emite `atendente_removido`.
+      operationId: removerAtendente
+      parameters:
+        - $ref: '#/components/parameters/AtendenteID'
+      responses:
+        '204':
+          description: Atendente removido com sucesso
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/dashboard:
+    get:
+      tags: [Dashboard]
+      summary: Snapshot do dashboard
+      description: |
+        Retorna o estado atual de todos os times: atendentes, solicitações ativas
+        por atendente (com tempo de fila quando aplicável), tamanho da fila e
+        contagem total em atendimento por time.
+      operationId: getDashboard
+      responses:
+        '200':
+          description: Snapshot atual
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardView'
+
+  /api/historico:
+    get:
+      tags: [Dashboard]
+      summary: Histórico de eventos
+      description: |
+        Retorna os últimos N eventos persistidos, do mais recente para o mais antigo.
+        Útil para popular o feed inicial antes de conectar ao stream SSE.
+      operationId: getHistorico
+      parameters:
+        - name: limite
+          in: query
+          required: false
+          description: Número máximo de eventos a retornar (padrão 50)
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 500
+          example: 20
+      responses:
+        '200':
+          description: Lista de eventos (pode ser vazia)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Evento'
+
+  /api/eventos:
+    get:
+      tags: [Dashboard]
+      summary: Stream SSE de eventos em tempo real
+      description: |
+        Abre um stream **Server-Sent Events** persistente. A cada mudança de estado
+        um evento é emitido no formato `data: <JSON>\n\n`.
+
+        Tipos de evento emitidos:
+
+        | Tipo | Quando | Campos extras |
+        |------|--------|---------------|
+        | `solicitacao_recebida` | Solicitação criada | `solicitacao_id` |
+        | `solicitacao_atribuida` | Atribuída a atendente | `solicitacao_id`, `atendente_id`, `tempo_na_fila_seg`* |
+        | `solicitacao_enfileirada` | Time lotado | `solicitacao_id`, `posicao_fila` |
+        | `atendimento_finalizado` | Atendimento encerrado | `solicitacao_id`, `duracao_atendimento_seg`, `tempo_na_fila_seg`* |
+        | `atendente_pausado` | Atendente pausado | `atendente_id`, `atendente_nome` |
+        | `atendente_retomado` | Atendente retomado | `atendente_id`, `atendente_nome` |
+        | `atendente_removido` | Atendente removido | `atendente_id`, `atendente_nome` |
+
+        \* Presente apenas se a solicitação passou pela fila.
+
+        **Não sujeito a rate limiting** (conexão persistente).
+      operationId: streamEventos
+      responses:
+        '200':
+          description: Stream SSE ativo — mantém conexão aberta indefinidamente
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              example: |
+                data: {"tipo":"solicitacao_atribuida","solicitacao_id":"sol_abc123","time":"CARTOES","atendente_id":"ate_x1","atendente_nome":"Ana","ocorreu":"2026-06-17T14:30:00Z"}
+
+  /api/health:
+    get:
+      tags: [Sistema]
+      summary: Health check
+      operationId: health
+      responses:
+        '200':
+          description: Serviço operacional
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+components:
+  parameters:
+    SolicitacaoID:
+      name: id
+      in: path
+      required: true
+      description: ID da solicitação (prefixo `sol_`)
+      schema:
+        type: string
+        example: "sol_a1b2c3d4e5f6a7b8"
+
+    AtendenteID:
+      name: id
+      in: path
+      required: true
+      description: ID do atendente (prefixo `ate_`)
+      schema:
+        type: string
+        example: "ate_a1b2c3d4"
+
+  responses:
+    BadRequest:
+      description: Corpo malformado ou campo obrigatório ausente/inválido
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErroResp'
+          example:
+            erro: "assunto inválido"
+
+    NotFound:
+      description: Recurso não encontrado
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErroResp'
+          example:
+            erro: "solicitação em atendimento não encontrada"
+
+    Conflict:
+      description: Operação bloqueada por invariante de negócio
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErroResp'
+          example:
+            erro: "atendente possui atendimentos ativos"
+
+  schemas:
+    CriarSolicitacaoReq:
+      type: object
+      required: [assunto]
+      properties:
+        assunto:
+          type: string
+          description: |
+            Código do assunto. Determina o time de destino:
+            - `problema_cartao` → Cartões
+            - `contratacao_emprestimo` → Empréstimos
+            - qualquer outro valor → Outros Assuntos
+          example: "problema_cartao"
+
+    AdicionarAtendenteReq:
+      type: object
+      required: [nome, time]
+      properties:
+        nome:
+          type: string
+          minLength: 1
+          example: "Ana"
+        time:
+          $ref: '#/components/schemas/NomeTime'
+
+    IDResp:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "sol_a1b2c3d4e5f6a7b8"
+
+    ErroResp:
+      type: object
+      properties:
+        erro:
+          type: string
+          example: "atendente possui atendimentos ativos"
+
+    NomeTime:
+      type: string
+      enum: [CARTOES, EMPRESTIMOS, OUTROS]
+      description: Identificador do time de atendimento
+      example: CARTOES
+
+    TipoEvento:
+      type: string
+      enum:
+        - solicitacao_recebida
+        - solicitacao_atribuida
+        - solicitacao_enfileirada
+        - atendimento_finalizado
+        - atendente_pausado
+        - atendente_retomado
+        - atendente_removido
+      example: solicitacao_atribuida
+
+    SolicitacaoAtivaView:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "sol_a1b2c3d4e5f6a7b8"
+        tempo_na_fila_seg:
+          type: integer
+          nullable: true
+          description: Presente apenas se a solicitação passou pela fila antes de ser atribuída
+          example: 42
+
+    AtendenteView:
+      type: object
+      properties:
+        id:
+          type: string
+          example: "ate_a1b2c3d4"
+        nome:
+          type: string
+          example: "Ana"
+        ativos:
+          type: integer
+          description: Atendimentos em andamento (0–3)
+          example: 2
+        capacidade:
+          type: integer
+          description: Limite máximo de atendimentos simultâneos
+          example: 3
+        pausado:
+          type: boolean
+          description: Quando `true`, o atendente não recebe novas solicitações
+          example: false
+        solicitacoes_ativas:
+          type: array
+          items:
+            $ref: '#/components/schemas/SolicitacaoAtivaView'
+
+    TimeView:
+      type: object
+      properties:
+        nome:
+          $ref: '#/components/schemas/NomeTime'
+        atendentes:
+          type: array
+          items:
+            $ref: '#/components/schemas/AtendenteView'
+        tamanho_fila:
+          type: integer
+          description: Solicitações aguardando na fila deste time
+          example: 3
+        em_atendimento:
+          type: integer
+          description: Total de atendimentos em andamento no time
+          example: 5
+
+    DashboardView:
+      type: object
+      properties:
+        times:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimeView'
+        atualizado_em:
+          type: string
+          format: date-time
+          example: "2026-06-17T14:30:00Z"
+
+    Evento:
+      type: object
+      description: Evento de domínio emitido via SSE e persistido no histórico
+      properties:
+        tipo:
+          $ref: '#/components/schemas/TipoEvento'
+        solicitacao_id:
+          type: string
+          nullable: true
+          description: Presente nos eventos de solicitação
+          example: "sol_a1b2c3d4e5f6a7b8"
+        time:
+          $ref: '#/components/schemas/NomeTime'
+        atendente_id:
+          type: string
+          nullable: true
+          example: "ate_a1b2c3d4"
+        atendente_nome:
+          type: string
+          nullable: true
+          example: "Ana"
+        posicao_fila:
+          type: integer
+          nullable: true
+          description: Posição na fila — presente apenas em `solicitacao_enfileirada`
+          example: 2
+        ocorreu:
+          type: string
+          format: date-time
+          example: "2026-06-17T14:30:00Z"
+        duracao_atendimento_seg:
+          type: integer
+          nullable: true
+          description: Duração do atendimento em segundos — presente em `atendimento_finalizado`
+          example: 127
+        tempo_na_fila_seg:
+          type: integer
+          nullable: true
+          description: |
+            Tempo de espera na fila em segundos. Presente em:
+            - `solicitacao_atribuida` quando a solicitação foi puxada da fila
+            - `atendimento_finalizado` quando a solicitação havia passado pela fila
+          example: 45
